@@ -1,0 +1,29 @@
+
+function event_camera_1 takes nothing returns nothing
+    local real x = USync.x
+    local real y = USync.y
+    call SetUnitX(gg_unit_opeo_0002, x)
+    call SetUnitY(gg_unit_opeo_0002, y)
+endfunction
+
+
+function timer_sync takes nothing returns nothing
+    local real x = GetCameraTargetPositionX()
+    local real y = GetCameraTargetPositionY()
+    
+    if GetLocalPlayer() == Player(1) then
+        call USync.send_coordinate("camera 1", x, y)
+    endif
+endfunction
+
+
+function Trig_CameraSync1_Actions takes nothing returns nothing
+    call USync.register_coordinate("camera 1", 1, false, function event_camera_1)
+    call TimerStart(CreateTimer(), 0.15, true,  function timer_sync)
+endfunction
+
+//===========================================================================
+function InitTrig_CameraSync1 takes nothing returns nothing
+    set gg_trg_CameraSync1 = CreateTrigger(  )
+    call TriggerAddAction( gg_trg_CameraSync1, function Trig_CameraSync1_Actions )
+endfunction

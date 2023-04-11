@@ -1,0 +1,649 @@
+
+library LibUSync initializer initialization
+globals
+    private constant integer MAX_MESSAGE_LEN = 3
+    private constant integer POINT_COUNT = 25
+    private constant real MAX_MESSAGE_POWER = Pow(POINT_COUNT, MAX_MESSAGE_LEN) - 1
+    
+    private constant integer UNIT_COUNT = POINT_COUNT
+    private constant integer UNIT_ID = 'h000'
+    private constant player UNIT_PLAYER = Player(PLAYER_NEUTRAL_PASSIVE)
+    // if the value is 0.12345, the unit will automatically be moved to the edge of the map
+    private real UNIT_X = 0.12345
+    private real UNIT_Y = 0.12345
+    
+    private constant unit array UNITS
+    private constant real array POWERS
+    private constant hashtable IS_UNIT = InitHashtable()
+endglobals
+
+
+private function get_message_len takes real dist, real maximum_error, string name returns integer
+    local real need_count = dist/maximum_error
+    local integer message_len = 1
+
+    if need_count > MAX_MESSAGE_POWER then
+        call BJDebugMsg("USyncWarring: it is impossible to meet the required accuracy when registering '"+name+"'")
+        call BJDebugMsg("Increase MAX_MESSAGE_LEN or decrease dist or increase accuracy_error")
+        return MAX_MESSAGE_LEN
+    endif
+
+    loop
+    exitwhen message_len >= MAX_MESSAGE_LEN
+        if POWERS[message_len] - 1 >= need_count then
+            exitwhen true
+        endif
+    set message_len = message_len + 1
+    endloop
+    
+    return message_len
+endfunction
+
+
+private function round takes real val returns integer // only positive numbers
+    if val-R2I(val) < R2I(val+1.)-val then
+        return R2I(val)
+    else
+        return R2I(val) + 1
+    endif
+endfunction
+
+
+private function select_unit takes integer ind returns nothing
+    call SelectUnit(UNITS[ind], true)
+    call SelectUnit(UNITS[ind], false)
+endfunction
+
+
+private function is_unit takes unit u returns boolean
+    return HaveSavedBoolean(IS_UNIT, 0, GetHandleId(u))
+endfunction
+
+
+private struct PendingData
+    real value
+    real x
+    real y
+endstruct
+
+
+private struct BasicMetadata
+    real min
+    real max
+    real dist
+    boolean is_int
+
+    integer message_len
+
+
+    static method create takes real min, real max, real maximum_error, boolean is_int, string name returns thistype
+        local thistype this = thistype.allocate()
+        if is_int then
+            set maximum_error = 1.
+        endif
+        set this.min = min
+        set this.max = max
+        set this.dist = max - min
+        set this.is_int = is_int
+        set this.message_len = get_message_len(this.dist, maximum_error, name)
+        return this
+    endmethod
+endstruct
+
+
+private struct CoordinateMetadata
+    integer message_len_x
+    integer message_len_y
+
+    integer message_len
+
+    static real min_x
+    static real max_x
+    static real dist_x
+    static real min_y
+    static real max_y
+    static real dist_y
+
+
+    static method create takes real maximum_error, string name returns thistype
+        local thistype this = thistype.allocate()
+        set this.message_len_x = get_message_len(thistype.dist_x, maximum_error, name)
+        set this.message_len_y = get_message_len(thistype.dist_y, maximum_error, name)
+        set this.message_len = this.message_len_x + this.message_len_y
+        return this
+    endmethod
+
+
+    static method init takes nothing returns nothing
+        local rect world_rect = GetWorldBounds()
+        set thistype.min_x = GetRectMinX(world_rect)
+        set thistype.max_x = GetRectMaxX(world_rect)
+        set thistype.dist_x = thistype.max_x - thistype.min_x
+        set thistype.min_y = GetRectMinY(world_rect)
+        set thistype.max_y = GetRectMaxY(world_rect)
+        set thistype.dist_y = thistype.max_y - thistype.min_y
+        set world_rect = null
+    endmethod
+endstruct
+
+
+private struct MessageType
+    static integer BASIC = 1
+    static integer COORDINATE = 2
+endstruct
+
+
+private struct Message
+    string name
+    integer point_id
+    integer meta_type
+    integer metadata // BasicMetadata or CoordinateMetadata
+    integer len
+    trigger trigger
+    
+    boolean buffering
+    boolean is_reached
+    boolean need_update
+    PendingData pending_data
+
+    private static hashtable NAME_TO_MESSAGE = InitHashtable()
+    private static hashtable POINT_TO_MESSAGE = InitHashtable()
+
+
+    static method load_from_name takes string name returns thistype
+         return LoadInteger(thistype.NAME_TO_MESSAGE, 0, StringHash(name))
+    endmethod
+    
+    
+    static method load_from_point takes integer point_id returns thistype
+        local thistype mess = LoadInteger(POINT_TO_MESSAGE, 0, point_id)
+        return mess
+    endmethod
+
+
+    method is_valid takes nothing returns boolean
+        return this != 0
+    endmethod
+
+    private static method save takes string name, integer point_id, thistype message returns nothing
+        call SaveInteger(thistype.NAME_TO_MESSAGE, 0, StringHash(name), message)
+        call SaveInteger(thistype.POINT_TO_MESSAGE, 0, point_id, message)
+    endmethod
+    
+
+    static method can_save takes string name returns boolean
+        if thistype.load_from_name(name) != 0 then
+            call BJDebugMsg("USyncWarring: name '"+name+"' is already taken")
+            return false
+        endif
+        return true
+    endmethod
+
+
+    static method create takes string name, integer point_id, integer mess_type, integer metadata, boolean buffering, code callback returns thistype
+        local thistype this = thistype.allocate()
+        set this.name = name
+        set this.point_id = point_id
+        set this.meta_type = mess_type
+        set this.metadata = metadata
+        set this.buffering = buffering
+        set this.trigger = CreateTrigger()
+        call TriggerAddCondition(this.trigger, Filter(callback))
+        if not buffering then
+            set this.is_reached = true
+            set this.pending_data = PendingData.create()
+        endif
+
+        if mess_type == MessageType.BASIC then
+            set this.len = BasicMetadata(metadata).message_len
+        elseif mess_type ==  MessageType.COORDINATE then
+            set this.len = CoordinateMetadata(metadata).message_len
+        else
+            call BJDebugMsg("USyncError: unknown metadata type "+I2S(mess_type))
+            return 0
+        endif
+        
+        if not thistype.can_save(name) then
+            return 0
+        endif
+
+        call thistype.save(name, point_id, this)
+        return this
+    endmethod
+endstruct
+
+
+private struct Registrar
+    private static integer point_id = -1
+    private static boolean register_is_over = false
+
+
+    private static method can_register takes string name, integer point_id returns boolean
+        if thistype.register_is_over or point_id >= POINT_COUNT then
+            call BJDebugMsg("USyncError: too many registered events")
+            call BJDebugMsg("Unable to register '"+name+"'")
+            return false
+        endif
+        if not Message.can_save(name) then
+            return false
+        endif
+        return true
+    endmethod
+
+
+    private static method lenght_message takes Message message returns integer
+        if not message.is_valid() then
+            return 0
+        endif
+        return message.len
+    endmethod
+
+
+    static method basic_register takes string name, real min, real max, real maximum_error, boolean is_int, boolean buffering, code callback returns integer
+        local BasicMetadata metadata
+        local Message message
+
+        if not thistype.can_register(name, thistype.point_id + 1) then
+            return 0
+        endif
+
+        set thistype.point_id = thistype.point_id + 1
+
+        set metadata = BasicMetadata.create(min, max, maximum_error, is_int, name)
+        set message =  Message.create(name, point_id, MessageType.BASIC, metadata, buffering, callback)
+        return thistype.lenght_message(message)
+    endmethod
+
+
+    static method coordinate_register takes string name, real maximum_error, boolean buffering, code callback returns integer
+        local CoordinateMetadata metadata
+        local Message message
+        
+        if not thistype.can_register(name, thistype.point_id + 1) then
+            return 0
+        endif
+        
+        set thistype.point_id = thistype.point_id + 1
+        
+        set metadata = CoordinateMetadata.create(maximum_error, name)
+        set message =  Message.create(name, point_id, MessageType.COORDINATE, metadata, buffering, callback)
+        return thistype.lenght_message(message)
+    endmethod
+endstruct
+
+
+private struct EventData
+    static integer player_id
+    static integer array unit_count
+    static unit array units[24][100]
+endstruct
+
+
+struct USync
+    private boolean is_start // == false
+    private integer current_data_len
+    private integer need_data_len
+    private integer array data[MAX_MESSAGE_LEN]
+    private Message message
+    private integer metadata
+    private integer meta_type
+    
+    // public data
+    static integer player_id
+    static real real
+    static integer integer
+    static real x
+    static real y
+
+    private static real int_error = 0.499
+    private static real min
+    private static real dist
+    private static boolean is_int
+
+
+    static method register_real takes string name, real min, real max, real maximum_error, boolean buffering, code callback returns integer
+        return Registrar.basic_register(name, min, max, maximum_error, false, buffering, callback)
+    endmethod
+
+
+    static method register_integer takes string name, integer min, integer max, boolean buffering, code callback returns integer
+        return Registrar.basic_register(name, min, max, 1., true, buffering, callback)
+    endmethod
+    
+    
+    static method register_coordinate takes string name, real maximum_error, boolean buffering, code callback returns integer
+        return Registrar.coordinate_register(name, maximum_error, buffering, callback)
+    endmethod
+
+
+    private static method send_header takes integer point_id returns nothing
+        call select_unit(point_id)
+    endmethod
+
+
+    private static method send_data takes real val, integer message_len, real min, real dist returns integer
+        local integer num
+        local integer i = message_len - 1
+        local integer kt
+
+        // (0. - 1.) * (POINT_COUNT**message_len-1)
+        set num = round( ((val-min)/dist) * (POWERS[message_len]-1) )
+        loop
+        exitwhen i < 0
+            set kt = R2I(num/POWERS[i]) // 0 - POINT_COUNT-1
+            set num = num - kt*R2I(POWERS[i])
+            call select_unit(kt)
+        set i = i - 1
+        endloop
+        return message_len
+    endmethod
+
+
+    private static method can_send takes Message message, BasicMetadata metadata, real val  returns boolean
+        if message == 0 then
+            call BJDebugMsg("USyncWarring: Error send '"+message.name+"'")
+            return false
+        endif
+        if val < metadata.min or val > metadata.max then
+            call BJDebugMsg("USyncWarring: Sending an incorrect value "+R2S(val)+" to '"+message.name+"'")
+            return false
+        endif
+        return true
+    endmethod
+
+
+    private static method can_send_coordinate takes Message message, real x, real y returns boolean
+        if message == 0 then
+            call BJDebugMsg("USyncWarring: Error send '"+message.name+"'")
+            return false
+        endif
+        if x < CoordinateMetadata.min_x or x > CoordinateMetadata.max_x then
+            call BJDebugMsg("USyncWarring: Sending an incorrect x "+R2S(x)+" to '"+message.name+"'")
+            return false
+        endif
+        if y < CoordinateMetadata.min_y or y > CoordinateMetadata.max_y then
+            call BJDebugMsg("USyncWarring: Sending an incorrect y "+R2S(y)+" to '"+message.name+"'")
+            return false
+        endif
+        return true
+    endmethod
+
+
+    static method send takes string name, real val returns boolean
+        local Message message = Message.load_from_name(name)
+        local BasicMetadata metadata = BasicMetadata(message.metadata)
+
+        if not thistype.can_send(message, metadata, val) then
+            return false
+        endif
+
+        if not message.buffering then
+            if message.is_reached then
+                set message.is_reached = false
+            else
+                set message.need_update = true
+                set message.pending_data.value = val
+                return true
+            endif
+        endif
+
+        call send_header(message.point_id)
+        call send_data(val, message.len, metadata.min, metadata.dist)
+        return true
+    endmethod
+
+
+    static method send_coordinate takes string name, real x, real y returns boolean
+        local Message message = Message.load_from_name(name)
+        local CoordinateMetadata metadata = CoordinateMetadata(message.metadata)
+
+        if not thistype.can_send_coordinate(message, x, y) then
+            return false
+        endif
+
+        if not message.buffering then
+            if message.is_reached then
+                set message.is_reached = false
+            else
+                set message.need_update = true
+                set message.pending_data.x = x
+                set message.pending_data.y = y
+                return true
+            endif
+        endif
+        call send_header(message.point_id)
+        call send_data(x, metadata.message_len_x, CoordinateMetadata.min_x, CoordinateMetadata.dist_x)
+        call send_data(y, metadata.message_len_y, CoordinateMetadata.min_y, CoordinateMetadata.dist_y)
+        return true
+    endmethod
+
+
+    private method start_collection takes integer point_id returns nothing
+        local Message message = Message.load_from_point(point_id)
+        if not message.is_valid() then
+            call BJDebugMsg("USyncError: received data error "+I2S(message))
+            return
+        endif
+        set this.message = message
+        set this.metadata = message.metadata
+        set this.meta_type = message.meta_type
+        set this.current_data_len = 0
+        set this.need_data_len = message.len
+        set this.is_start = true
+    endmethod
+
+
+    private method build_number takes integer start, integer data_len returns real
+        local integer end = start + data_len
+        local integer num = 0
+        local real result
+
+        loop
+        exitwhen start >= end
+            set num = num*POINT_COUNT + this.data[start]
+        set start = start + 1
+        endloop
+
+        set result = thistype.dist*(num/(POWERS[data_len]-1))
+
+        if thistype.is_int then
+            set result = round(result)
+        endif
+
+        return thistype.min + result
+    endmethod
+
+
+    private static method build_and_update_data takes thistype this returns nothing
+        local Message message = this.message
+        local integer message_len_x
+
+        set message.is_reached = true
+
+        if this.meta_type == MessageType.BASIC then
+            set thistype.min = BasicMetadata(this.metadata).min
+            set thistype.dist = BasicMetadata(this.metadata).dist
+            set thistype.is_int = BasicMetadata(this.metadata).is_int
+            set thistype.real = this.build_number(0, this.need_data_len)
+
+            if thistype.is_int then
+                set thistype.integer = R2I(thistype.real)
+            endif
+
+            if message.need_update then
+                set message.need_update = false
+                call thistype.send(message.name, message.pending_data.value)
+            endif
+
+        elseif this.meta_type == MessageType.COORDINATE then
+            set message_len_x = CoordinateMetadata(this.metadata).message_len_x
+            set thistype.min = CoordinateMetadata.min_x
+            set thistype.dist = CoordinateMetadata.dist_x
+            set thistype.is_int = false
+            set thistype.x = this.build_number(0, message_len_x)
+
+            set thistype.min = CoordinateMetadata.min_y
+            set thistype.dist = CoordinateMetadata.dist_y
+            set thistype.y = this.build_number(message_len_x, CoordinateMetadata(this.metadata).message_len_y)
+
+            if message.need_update then
+                set message.need_update = false
+                call thistype.send_coordinate(message.name, message.pending_data.x, message.pending_data.y)
+            endif
+        endif
+    endmethod
+
+
+   private method push takes integer num returns nothing
+        if not this.is_start then
+            call this.start_collection(num) 
+            return
+        endif
+        set this.data[this.current_data_len] = num
+        set this.current_data_len = this.current_data_len + 1
+
+        if this.current_data_len >= this.need_data_len then
+            call build_and_update_data(this)
+            set this.is_start = false
+            call TriggerEvaluate(this.message.trigger)
+        endif
+   endmethod
+
+
+    static method event_select takes nothing returns boolean
+        local integer pid = EventData.player_id
+        local integer event_count = EventData.unit_count[pid] // >= 1
+        local thistype uplayer = thistype(pid+1)
+        local integer i = 0
+        set thistype.player_id = pid
+        loop
+        exitwhen i >= event_count
+            call uplayer.push(GetUnitUserData(EventData.units[pid][i]))
+        set i = i + 1
+        endloop
+
+        return false
+    endmethod
+endstruct
+
+
+private struct EventTrigger
+    private static boolean is_select_start = false
+    private static integer player_id
+    private static integer player_count
+    private static integer array players
+
+    private static timer selection_timer = CreateTimer()
+
+
+    private static method select_with_timer  takes nothing returns nothing
+        local integer i = 0
+        set thistype.is_select_start = false
+        loop
+        exitwhen i >= thistype.player_count
+            set EventData.player_id = thistype.players[i]
+            call USync.event_select()
+        set i = i + 1
+        endloop
+    endmethod
+
+
+    private static method add_player takes integer pid returns nothing
+        local integer i = 0
+        loop
+        exitwhen i >= thistype.player_count
+            if thistype.players[i] == pid then
+                return
+            endif
+        set i = i + 1
+        endloop
+        set thistype.players[thistype.player_count] = pid
+        set thistype.player_count = thistype.player_count + 1
+
+        set thistype.player_id = pid
+        set EventData.unit_count[pid] = 0
+    endmethod
+
+
+    private static method trigger_select takes nothing returns boolean
+        local integer pid = GetPlayerId(GetTriggerPlayer())
+        if not is_unit(GetTriggerUnit()) then
+            return false
+        endif
+        if not thistype.is_select_start then
+
+            set thistype.is_select_start = true
+
+            set thistype.players[0] = pid
+            set thistype.player_count = 1
+
+            set thistype.player_id = pid
+            set EventData.unit_count[pid] = 0
+
+            call TimerStart(thistype.selection_timer, 0., false, function thistype.select_with_timer)
+        endif
+        
+        if thistype.player_id != pid then
+            call thistype.add_player(pid)
+        endif
+
+        set EventData.units[pid][EventData.unit_count[pid]] = GetTriggerUnit()
+        set EventData.unit_count[pid] = EventData.unit_count[pid] + 1
+        return false
+    endmethod
+
+
+    static method init takes nothing returns nothing
+        local trigger trig = CreateTrigger()
+        local integer i = bj_MAX_PLAYERS
+        loop
+        exitwhen i < 0
+            call TriggerRegisterPlayerUnitEvent(trig, Player(i), EVENT_PLAYER_UNIT_SELECTED, null)
+        set i = i - 1
+        endloop
+        call TriggerAddCondition(trig, Condition( function thistype.trigger_select ))
+        set trig = null
+    endmethod
+endstruct
+
+
+private function initialization_unit takes nothing returns nothing
+    local integer i = 0
+    if UNITS[i] != null then
+        return
+    endif
+    if UNIT_X == 0.12345 then
+        set UNIT_X = CoordinateMetadata.min_x
+    endif
+    if UNIT_Y == 0.12345 then
+        set UNIT_Y = CoordinateMetadata.min_y
+    endif
+
+    loop
+    exitwhen i >= UNIT_COUNT
+        set UNITS[i] = CreateUnit(UNIT_PLAYER, UNIT_ID, UNIT_X, UNIT_Y, 0.)
+        call SetUnitUserData(UNITS[i], i)
+        call SaveBoolean(IS_UNIT, 0, GetHandleId(UNITS[i]), true)
+    set i = i + 1
+    endloop
+endfunction
+
+
+private function initialization_powers takes nothing returns nothing
+    local integer i = 0
+    
+    loop
+    exitwhen i > MAX_MESSAGE_LEN
+        set POWERS[i] = Pow(POINT_COUNT, i)
+    set i = i + 1
+    endloop
+endfunction
+
+
+private function initialization takes nothing returns nothing
+    call EventTrigger.init()
+    call CoordinateMetadata.init()
+    call initialization_unit()
+    call initialization_powers()
+endfunction
+endlibrary

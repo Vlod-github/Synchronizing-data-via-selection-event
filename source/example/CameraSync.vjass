@@ -1,0 +1,30 @@
+
+function sync_xy takes nothing returns nothing
+    local real x = GetCameraTargetPositionX()
+    local real y = GetCameraTargetPositionY()
+    
+    if GetLocalPlayer() == Player(0) then
+        call USync.send_coordinate("camera 0", x, y)
+    endif
+endfunction
+
+
+function event_camera_pl_0 takes nothing returns nothing
+    local real x = USync.x
+    local real y = USync.y
+    call SetUnitX(gg_unit_hpea_0001, x)
+    call SetUnitY(gg_unit_hpea_0001, y)
+    call sync_xy()
+endfunction
+
+
+function Trig_CameraSync_Actions takes nothing returns nothing
+    call USync.register_coordinate("camera 0", 1, true, function event_camera_pl_0)
+    call sync_xy()
+endfunction
+
+//===========================================================================
+function InitTrig_CameraSync takes nothing returns nothing
+    set gg_trg_CameraSync = CreateTrigger(  )
+    call TriggerAddAction( gg_trg_CameraSync, function Trig_CameraSync_Actions )
+endfunction

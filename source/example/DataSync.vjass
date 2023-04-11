@@ -1,0 +1,53 @@
+
+globals
+    real real_data = -50
+    integer int_data = -100
+endglobals
+
+
+function event_real takes nothing returns nothing
+    local real data = USync.real
+    call BJDebugMsg("sync real_data "+R2S(data))
+    call BJDebugMsg("sync player_id "+I2S(USync.player_id))
+    call BJDebugMsg("--------------")
+endfunction
+
+
+function event_int takes nothing returns nothing
+    local integer data = USync.integer
+    call BJDebugMsg("sync int_data "+I2S(data))
+    call BJDebugMsg("sync player_id "+I2S(USync.player_id))
+    call BJDebugMsg("--------------")
+endfunction
+
+
+function timer_send_data takes nothing returns nothing
+    local integer rand = GetRandomInt(0, 1)
+    if GetLocalPlayer() == Player(0) then
+        if rand == 0 then
+            call BJDebugMsg("real_data "+R2S(real_data))
+
+            call USync.send("data real", real_data)
+            set real_data = real_data + 0.5
+
+        else
+            call BJDebugMsg("int_data "+I2S(int_data))
+
+            call USync.send("data int", int_data)
+            set int_data = int_data + 1
+        endif
+    endif
+endfunction
+
+
+function Trig_DataSync_Actions takes nothing returns nothing
+    call USync.register_real("data real", -50, 50, 0.5, true, function event_real)
+    call USync.register_integer("data int", -100, 100, true, function event_int)
+    call TimerStart(CreateTimer(), 3, true, function timer_send_data)
+endfunction
+
+//===========================================================================
+function InitTrig_DataSync takes nothing returns nothing
+    set gg_trg_DataSync = CreateTrigger(  )
+    call TriggerAddAction( gg_trg_DataSync, function Trig_DataSync_Actions )
+endfunction
